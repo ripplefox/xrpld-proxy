@@ -217,7 +217,7 @@ function handleClientRequest(ws, rawData) {
                 sendXrpldError(ws, originalId, command, "timeout", "Gateway forcefully closed the long-lived stream after 3 minutes limit.", 408);
                 requestMap.delete(internalId);
             }
-        }, 60000); 
+        }, 180000); 
     }
 
     requestMap.set(internalId, {
@@ -259,7 +259,7 @@ function handleBackendMessage(rawData, node) {
     // 【自愈机制 2：流式报文超限截断】
     if (internalId.startsWith('pf_')) {
         ctx.streamCount++;
-        if (ctx.streamCount > 2) {
+        if (ctx.streamCount > 20) {
             console.log(`[ANTI-DEADLOCK] Flow stream ${internalId} exceeded 20 updates. Force terminating.`);
             if (node.client && node.client.readyState === WebSocket.OPEN) {
                 node.client.send(JSON.stringify({ command: "path_find", sub_command: "close" }));
