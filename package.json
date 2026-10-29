@@ -1,0 +1,15 @@
+{
+  "name": "xrpld-proxy",
+  "version": "1.0.0",
+  "description": "A xrpld proxy for China users.",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "author": "ripplefox",
+  "license": "ISC",
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}
