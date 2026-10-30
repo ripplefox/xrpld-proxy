@@ -176,7 +176,6 @@ function handleClientRequest(ws, rawData) {
     try {
         payload = JSON.parse(rawData);
     } catch (e) {
-        // 无有效 ID 和 Command 时，直接对齐 XRPL 的 jsonInvalid 报错规范
         return sendXrpldError(ws, undefined, undefined, "jsonInvalid", "Your request could not be parsed as valid JSON.", 90);
     }
 
@@ -187,27 +186,31 @@ function handleClientRequest(ws, rawData) {
         return sendXrpldError(ws, originalId, undefined, "missingCommand", "The request does not contain a command field.", 91);
     }
 
+    // 识别特殊的特殊流式广播命令：判断是否为 ledger 订阅
     const isPathFind = (command === 'path_find' || command === 'ripple_path_find');
-    // 【升级优化】：将 subscribe 订阅命令也识别为长连接 Stream，防止响应单次请求后被误杀
-    const isStreamCmd = (isPathFind || command === 'subscribe');
+    const isLedgerSubscribe = (command === 'subscribe' && payload.streams && payload.streams.includes('ledger'));
+    
     const clusterKey = isPathFind ? 'pathFind' : 'submit';
     
+    // 路由选点
     const selectedNode = selectNode(command, clusterKey);
     if (!selectedNode) {
-        // 【集群全满载】：触发 busy 错，完全对齐 XRPLD 原生大流量下的 slowDown / amtaNoNodes 机制并透传 busy
         return sendXrpldError(ws, originalId, command, "busy", "All backend nodes are saturated or offline. Please retry later.", 88);
     }
 
+    // 会话 ID 动态映射
     internalIdCounter++;
-    // 持久流使用 'pf_' 作为前缀挂载长连接监听，非流式单次请求使用 'sub_' 前缀
-    const prefix = isStreamCmd ? 'pf_' : 'sub_';
+    let prefix = 'sub_';
+    if (isPathFind) prefix = 'pf_';
+    if (isLedgerSubscribe) prefix = 'led_'; // 赋予 ledger 订阅专属前缀
+    
     const internalId = `${prefix}${internalIdCounter}`;
 
     console.log(`[ROUTE] Command: ${command} | Client ID: ${originalId} -> Internal ID: ${internalId} | Target: ${selectedNode.url}`);
 
     let lifecycleTimer = null;
     if (isPathFind) {
-        // 【自愈机制 3：绝对生命周期窗口 3分钟】仅针对 path_find 生效
+        // 【自愈机制 3：绝对生命周期窗口 3分钟】
         lifecycleTimer = setTimeout(() => {
             if (requestMap.has(internalId)) {
                 console.log(`[ANTI-DEADLOCK] Absolute lifecycle timeout for ${internalId}. Evicting.`);
@@ -215,8 +218,6 @@ function handleClientRequest(ws, rawData) {
                     selectedNode.client.send(JSON.stringify({ command: "path_find", sub_command: "close" }));
                 }
                 selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
-                
-                // 超时强制清退：返回 XRPL 标准的 timeout 错
                 sendXrpldError(ws, originalId, command, "timeout", "Gateway forcefully closed the long-lived stream after 3 minutes limit.", 408);
                 requestMap.delete(internalId);
             }
@@ -233,12 +234,20 @@ function handleClientRequest(ws, rawData) {
     });
 
     payload.id = internalId;
-    selectedNode.activeRequests++;
+
+    // 【修改点】：如果不是 ledger 订阅，才占用节点的并发计数器
+    if (!isLedgerSubscribe) {
+        selectedNode.activeRequests++;
+    } else {
+        console.log(`[BYPASS] Ledger subscription bypasses concurrency counters for ${selectedNode.url}`);
+    }
     
     try {
         selectedNode.client.send(JSON.stringify(payload));
     } catch (err) {
-        selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
+        if (!isLedgerSubscribe) {
+            selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
+        }
         requestMap.delete(internalId);
         if (lifecycleTimer) clearTimeout(lifecycleTimer);
         handleNodeFailure(selectedNode, clusterKey);
@@ -252,18 +261,26 @@ function handleBackendMessage(rawData, node) {
         payload = JSON.parse(rawData);
     } catch (e) { return; }
 
-    const internalId = payload.id;
-    if (!internalId || !requestMap.has(internalId)) {
-        console.log(`[WARN] Inernal ID not in requestMap ${payload.id}.`);
+    // 针对 XRPL 异步 ledger 广播推送包（通常无请求 ID 或返回类型为 ledgerClosed）进行上下文匹配
+    let internalId = payload.id;
+    
+    // 如果是后端主动分发的无 ID 的 ledger 广播，需要全量广播给订阅了该节点的客户端
+    if (!internalId && payload.type === "ledgerClosed") {
+        for (const [id, ctx] of requestMap.entries()) {
+            if (id.startsWith('led_') && ctx.node === node && ctx.ws.readyState === WebSocket.OPEN) {
+                try { ctx.ws.send(rawData); } catch(e){}
+            }
+        }
         return;
     }
 
+    if (!internalId || !requestMap.has(internalId)) return;
     const ctx = requestMap.get(internalId);
     
     console.log(`[RESPONSE] Internal ID: ${internalId} -> Client ID: ${ctx.originalId}`);
 
-    // 【自愈机制 2：流式报文超限截断】仅对 path_find 的频繁更新做次数防御截断
-    if (internalId.startsWith('pf_') && ctx.command !== 'subscribe') {
+    // 【自愈机制 2：流式报文超限截断】
+    if (internalId.startsWith('pf_')) {
         ctx.streamCount++;
         if (ctx.streamCount > 20) {
             console.log(`[ANTI-DEADLOCK] Flow stream ${internalId} exceeded 20 updates. Force terminating.`);
@@ -272,14 +289,13 @@ function handleBackendMessage(rawData, node) {
             }
             node.activeRequests = Math.max(0, node.activeRequests - 1);
             clearTimeout(ctx.timer);
-            
-            // 超限熔断：返回符合规范的 tooBusy / excessiveUpdates 错误
             sendXrpldError(ctx.ws, ctx.originalId, ctx.command, "tooBusy", "Path find updates exceeded maximum gateway buffer threshold (20 limit).", 89);
             requestMap.delete(internalId);
             return;
         }
     }
 
+    // 还原原始客户端请求 ID 并回传
     payload.id = ctx.originalId;
     
     try {
@@ -288,7 +304,7 @@ function handleBackendMessage(rawData, node) {
         }
     } catch (e) {}
 
-    // 单次请求（如 submit, tx 等）在拿到响应后直接回收网关计数并释放内存映射
+    // 【修改点】：普通命令正常释放计数与映射；ledger 订阅（led_）属于长连接流，初次订阅成功回包后也“不释放映射”，持续等待推送
     if (internalId.startsWith('sub_')) {
         node.activeRequests = Math.max(0, node.activeRequests - 1);
         requestMap.delete(internalId);
