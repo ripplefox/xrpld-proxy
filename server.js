@@ -188,6 +188,8 @@ function handleClientRequest(ws, rawData) {
     }
 
     const isPathFind = (command === 'path_find' || command === 'ripple_path_find');
+    // 【升级优化】：将 subscribe 订阅命令也识别为长连接 Stream，防止响应单次请求后被误杀
+    const isStreamCmd = (isPathFind || command === 'subscribe');
     const clusterKey = isPathFind ? 'pathFind' : 'submit';
     
     const selectedNode = selectNode(command, clusterKey);
@@ -197,14 +199,15 @@ function handleClientRequest(ws, rawData) {
     }
 
     internalIdCounter++;
-    const prefix = isPathFind ? 'pf_' : 'sub_';
+    // 持久流使用 'pf_' 作为前缀挂载长连接监听，非流式单次请求使用 'sub_' 前缀
+    const prefix = isStreamCmd ? 'pf_' : 'sub_';
     const internalId = `${prefix}${internalIdCounter}`;
 
     console.log(`[ROUTE] Command: ${command} | Client ID: ${originalId} -> Internal ID: ${internalId} | Target: ${selectedNode.url}`);
 
     let lifecycleTimer = null;
     if (isPathFind) {
-        // 【自愈机制 3：绝对生命周期窗口 3分钟】
+        // 【自愈机制 3：绝对生命周期窗口 3分钟】仅针对 path_find 生效
         lifecycleTimer = setTimeout(() => {
             if (requestMap.has(internalId)) {
                 console.log(`[ANTI-DEADLOCK] Absolute lifecycle timeout for ${internalId}. Evicting.`);
@@ -250,14 +253,17 @@ function handleBackendMessage(rawData, node) {
     } catch (e) { return; }
 
     const internalId = payload.id;
-    if (!internalId || !requestMap.has(internalId)) return;
+    if (!internalId || !requestMap.has(internalId)) {
+        console.log(`[WARN] Inernal ID not in requestMap ${internalId}.`);
+        return;
+    }
 
     const ctx = requestMap.get(internalId);
     
     console.log(`[RESPONSE] Internal ID: ${internalId} -> Client ID: ${ctx.originalId}`);
 
-    // 【自愈机制 2：流式报文超限截断】
-    if (internalId.startsWith('pf_')) {
+    // 【自愈机制 2：流式报文超限截断】仅对 path_find 的频繁更新做次数防御截断
+    if (internalId.startsWith('pf_') && ctx.command !== 'subscribe') {
         ctx.streamCount++;
         if (ctx.streamCount > 20) {
             console.log(`[ANTI-DEADLOCK] Flow stream ${internalId} exceeded 20 updates. Force terminating.`);
@@ -282,6 +288,7 @@ function handleBackendMessage(rawData, node) {
         }
     } catch (e) {}
 
+    // 单次请求（如 submit, tx 等）在拿到响应后直接回收网关计数并释放内存映射
     if (internalId.startsWith('sub_')) {
         node.activeRequests = Math.max(0, node.activeRequests - 1);
         requestMap.delete(internalId);
@@ -354,10 +361,44 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         activeFrontendClients = Math.max(0, activeFrontendClients - 1);
-        // 清理该前端残留的未决映射（防止因前端单向断流导致的网关计数和并发名额被僵尸请求长期霸占）
+        
+        // 遍历所有映射关系，清理该前端残留的未决映射与底层订阅流
         for (const [internalId, ctx] of requestMap.entries()) {
             if (ctx.ws === ws) {
                 clearTimeout(ctx.timer);
+                
+                // === 【核心修复代码：向后端节点同步下发退订指令】 ===
+                if (ctx.node && ctx.node.client && ctx.node.client.readyState === WebSocket.OPEN) {
+                    if (internalId.startsWith('pf_')) {
+                        if (ctx.command === 'subscribe') {
+                            // 针对订阅请求（例如 ledger 账本流），在前端断开时显式通知对应的下游节点退订
+                            try {
+                                ctx.node.client.send(JSON.stringify({
+                                    id: internalId,
+                                    command: "unsubscribe",
+                                    streams: ["ledger", "accounts"] // 强制解除最常见的长轮询基础流
+                                }));
+                                console.log(`[UNSUBSCRIBE] Automatically clean up subscription stream for internal ID: ${internalId}`);
+                            } catch (e) {
+                                console.error(`[ERR] Failed to send unsubscribe down to node for ${internalId}`, e);
+                            }
+                        } else {
+                            // 针对普通的 path_find 路径查找长连接进行关闭
+                            try {
+                                ctx.node.client.send(JSON.stringify({ 
+                                    id: internalId,
+                                    command: "path_find", 
+                                    sub_command: "close" 
+                                }));
+                            } catch (e) {
+                                console.error(`[ERR] Failed to close path_find downstream for ${internalId}`, e);
+                            }
+                        }
+                    }
+                }
+                // === 【修复结束】 ===
+
+                // 释放该连接占用的节点并发名额并安全移出内存映射
                 ctx.node.activeRequests = Math.max(0, ctx.node.activeRequests - 1);
                 requestMap.delete(internalId);
             }
@@ -380,10 +421,8 @@ const heartBeatInterval = setInterval(() => {
 wss.on('close', () => {
     clearInterval(heartBeatInterval);
 });
-
 // 启动网关服务
 server.listen(PORT, () => {
     console.log(`[GATEWAY] XRPLD Balance Proxy running on port ${PORT}`);
     initBackendCluster(); // 初始化下游 XRPL 节点集群连接
 });
-
