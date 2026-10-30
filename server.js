@@ -254,7 +254,7 @@ function handleBackendMessage(rawData, node) {
 
     const internalId = payload.id;
     if (!internalId || !requestMap.has(internalId)) {
-        console.log(`[WARN] Inernal ID not in requestMap ${internalId}.`);
+        console.log(`[WARN] Inernal ID not in requestMap ${payload.id}.`);
         return;
     }
 
