@@ -17,8 +17,7 @@ const clusters = {
         ]
     },
     submit: {
-        maxConcurrency: 5,
-        currentIndex: 0, // 用于平滑轮询 (Round Robin)
+        maxConcurrency: 6,
         nodes: [
             { url: 'wss://s1.ripple.com', status: 'Offline', activeRequests: 0, failCount: 0, client: null },
             { url: 'wss://s2.ripple.com', status: 'Offline', activeRequests: 0, failCount: 0, client: null },
@@ -153,14 +152,11 @@ function selectNode(command, clusterKey) {
     }
     
     if (clusterKey === 'submit') {
-        const availableNodes = cluster.nodes.filter(n => n.status === 'Online');
-        if (availableNodes.length === 0) return null;
-
+        // 【算法改进】：顺序填充策略（客户端优先连接同一个节点，直到满载才切换下一个）
         for (let i = 0; i < cluster.nodes.length; i++) {
-            const idx = (cluster.currentIndex + i) % cluster.nodes.length;
-            const node = cluster.nodes[idx];
+            const node = cluster.nodes[i];
+            // 只要节点在线，且当前的并发请求数还没有达到设定的上限，就直接锁定该节点
             if (node.status === 'Online' && node.activeRequests < cluster.maxConcurrency) {
-                cluster.currentIndex = (idx + 1) % cluster.nodes.length;
                 return node;
             }
         }
@@ -317,35 +313,46 @@ function handleBackendMessage(rawData, node) {
 const server = http.createServer((req, res) => {
     const parsedUrl = url.parse(req.url, true);
     
-    // 同时支持 /status 和 / 根路径路由访问监控看板
     if (parsedUrl.pathname === '/status' || parsedUrl.pathname === '/') {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         
-        let pClusterStr = '';
-        clusters.pathFind.nodes.forEach(n => {
-            const statusLabel = n.status === 'Online' ? '[● Online]' : (n.status === 'Isolated' ? '[⚠️ Isolated]' : '[○ Offline]');
-            const progress = '■'.repeat(n.activeRequests) + ' '.repeat(clusters.pathFind.maxConcurrency - n.activeRequests);
-            pClusterStr += `  - ${n.url.padEnd(25)} ${statusLabel.padEnd(13)} Load: [${progress}] ${n.activeRequests}/${clusters.pathFind.maxConcurrency}\n`;
-        });
+        // 提取通用的节点状态看板渲染逻辑
+        const renderCluster = (nodes, maxConcurrency) => {
+            let str = '';
+            nodes.forEach(n => {
+                let statusLabel = '[○ Offline]';
+                if (n.status === 'Online') {
+                    // 如果是在线状态，进一步区分是否已经占满连接
+                    statusLabel = n.activeRequests >= maxConcurrency ? '[🔥 FULL]   ' : '[● Online]  ';
+                } else if (n.status === 'Isolated') {
+                    statusLabel = '[⚠️ Isolated]';
+                }
+                
+                // 计算负载百分比并绘制进度条
+                const usagePercent = Math.round((n.activeRequests / maxConcurrency) * 100);
+                const progress = '■'.repeat(n.activeRequests) + ' '.repeat(maxConcurrency - n.activeRequests);
+                
+                str += `  - ${n.url.padEnd(25)} ${statusLabel} 负载: [${progress}] ${String(n.activeRequests).padStart(2)}/${maxConcurrency} (${String(usagePercent).padStart(3)}%)\n`;
+            });
+            return str;
+        };
 
-        let sClusterStr = '';
-        clusters.submit.nodes.forEach(n => {
-            const statusLabel = n.status === 'Online' ? '[● Online]' : (n.status === 'Isolated' ? '[⚠️ Isolated]' : '[○ Offline]');
-            const progress = '■'.repeat(n.activeRequests) + ' '.repeat(clusters.submit.maxConcurrency - n.activeRequests);
-            sClusterStr += `  - ${n.url.padEnd(25)} ${statusLabel.padEnd(13)} Load: [${progress}] ${n.activeRequests}/${clusters.submit.maxConcurrency}\n`;
-        });
+        const pClusterStr = renderCluster(clusters.pathFind.nodes, clusters.pathFind.maxConcurrency);
+        const sClusterStr = renderCluster(clusters.submit.nodes, clusters.submit.maxConcurrency);
 
-        // 扁平化无框看板设计
+        // 现代化、更具可读性的无框看板设计
         const view = 
-`========================================================
- XRPLD LB CLUSTER STATUS
-========================================================
- Active Frontend Clients: ${activeFrontendClients}
+`======================================================================
+ XRPLD REVERSE PROXY & LOAD BALANCER STATUS
+======================================================================
+ [Gateway Telemetry]
+  - Active Frontend Clients : ${activeFrontendClients}
+  - Total Memory Mapping Contexts : ${requestMap.size}
 
- [Path Find Cluster]
+ [Path Find Cluster] (Strategy: Minimum Load Available)
 ${pClusterStr}
- [Submit Cluster]
-${sClusterStr}========================================================\n`;
+ [Submit Cluster] (Strategy: Linear Fill / First Available)
+${sClusterStr}======================================================================\n`;
         
         res.end(view);
     } else {
