@@ -10,8 +10,7 @@ const CONFIG_PATH = path.join(__dirname, 'domains.json');
 function loadDomainList() {
     try {
         if (!fs.existsSync(CONFIG_PATH)) {
-            // 如果文件不存在，默认创建一个示例文件
-            const defaultList = ["example.com"];
+            const defaultList = ["example.com", "ripplefox.com:8443"];
             fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultList, null, 4), 'utf-8');
             return defaultList;
         }
@@ -19,17 +18,27 @@ function loadDomainList() {
         return JSON.parse(content);
     } catch (error) {
         console.error('读取配置文件失败:', error.message);
-        return []; // 出错时返回空列表，防止服务崩溃
+        return [];
     }
 }
 
-// 利用内置 tls 模块建立安全连接，抓取 SSL 证书信息
-function getCertificateExpiry(domain) {
+// 核心改进：解析域名和端口，并抓取 SSL 证书信息
+function getCertificateExpiry(domainInput) {
     return new Promise((resolve) => {
+        let host = domainInput.trim();
+        let port = 443; // 默认端口
+
+        // 核心逻辑：判断是否显示指明了端口号 (例如 ripplefox.com:8443)
+        if (host.includes(':')) {
+            const parts = host.split(':');
+            host = parts[0];
+            port = parseInt(parts[1], 10) || 443;
+        }
+
         const options = {
-            host: domain,
-            port: 443,
-            servername: domain, // 支持 SNI
+            host: host,
+            port: port,
+            servername: host, // 支持 SNI
             rejectUnauthorized: false // 即使证书过期也要允许连接以便抓取时间
         };
 
@@ -38,7 +47,7 @@ function getCertificateExpiry(domain) {
             socket.end(); // 拿到证书立即断开连接
 
             if (!cert || !cert.valid_to) {
-                return resolve({ domain, expiryDate: '未知', remainingDays: 9999, status: '未能抓取到证书' });
+                return resolve({ display: domainInput, expiryDate: '未知', remainingDays: 9999, status: '未能抓取到证书' });
             }
 
             const expiryDate = new Date(cert.valid_to);
@@ -46,22 +55,22 @@ function getCertificateExpiry(domain) {
             const remainingDays = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24));
 
             resolve({
-                domain,
+                display: `${host}:${port}`,
                 expiryDate: expiryDate.toISOString().split('T')[0], // 格式化为 YYYY-MM-DD
                 remainingDays,
                 status: remainingDays <= 15 ? '⚠️ 证书即将过期' : '✅ 正常'
             });
         });
 
-        // 错误处理（如域名无法连接、未开通 443 等）
+        // 错误处理（如网络不通、端口未开放等）
         socket.on('error', (err) => {
-            resolve({ domain, expiryDate: '无法连接', remainingDays: 9999, status: `连接失败: ${err.message}` });
+            resolve({ display: `${host}:${port}`, expiryDate: '无法连接', remainingDays: 9999, status: `连接失败: ${err.message}` });
         });
 
         // 5秒超时断开
         socket.setTimeout(5000, () => {
             socket.end();
-            resolve({ domain, expiryDate: '连接超时', remainingDays: 9999, status: '网络请求超时' });
+            resolve({ display: `${host}:${port}`, expiryDate: '连接超时', remainingDays: 9999, status: '网络请求超时' });
         });
     });
 }
@@ -74,7 +83,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // 每次请求实时加载最新的域名列表，无需重启服务
     const domainList = loadDomainList();
 
     if (domainList.length === 0) {
@@ -83,24 +91,24 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // 并发请求所有域名的证书
+    // 并发请求所有域名的证书信息
     const results = await Promise.all(domainList.map(domain => getCertificateExpiry(domain)));
     
     // 按证书剩余天数由近到远（升序）排序
     results.sort((a, b) => a.remainingDays - b.remainingDays);
 
     // 格式化纯文本表格
-    let textOutput = `🌐 网站 HTTPS 证书到期监控清单 (配置文件动态加载/已排序)\n`;
-    textOutput += `============================================================\n`;
-    textOutput += `${'域名'.padEnd(20)}${'证书到期日'.padEnd(15)}${'剩余天数'.padEnd(12)}状态\n`;
-    textOutput += `============================================================\n`;
+    let textOutput = `🌐 网站 HTTPS 证书到期监控清单 (支持自定义端口/已排序)\n`;
+    textOutput += `==================================================================\n`;
+    textOutput += `${'域名及端口'.padEnd(30)}${'证书到期日'.padEnd(15)}${'剩余天数'.padEnd(12)}状态\n`;
+    textOutput += `==================================================================\n`;
 
     results.forEach(r => {
         const daysStr = r.remainingDays === 9999 ? 'N/A' : `${r.remainingDays} 天`;
-        textOutput += `${r.domain.padEnd(20)}${r.expiryDate.padEnd(15)}${daysStr.padEnd(12)}${r.status}\n`;
+        textOutput += `${r.display.padEnd(30)}${r.expiryDate.padEnd(15)}${daysStr.padEnd(12)}${r.status}\n`;
     });
     
-    textOutput += `============================================================\n`;
+    textOutput += `==================================================================\n`;
     textOutput += `更新时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n`;
 
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
